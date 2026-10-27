@@ -1,0 +1,163 @@
+<#
+.SYNOPSIS
+Checks whether a user's home network is stable enough for Cisco Secure Client VPN.
+
+.DESCRIPTION
+Runs a short, read-only stability test against the local router, the internet, and
+the VPN gateway. It produces a plain-English verdict plus a report on the Desktop.
+No network settings, Cisco configuration, passwords, or tokens are changed or collected.
+
+.EXAMPLE
+.\Collect-CiscoVpnDiagnostics.ps1
+
+.EXAMPLE
+.\Collect-CiscoVpnDiagnostics.ps1 -VpnGateway vpn.company.com -SampleCount 20
+#>
+
+[CmdletBinding()]
+param(
+    [string]$VpnGateway,
+    [ValidateRange(10, 60)]
+    [int]$SampleCount = 20,
+    [string]$OutputDirectory = (Join-Path $env:USERPROFILE 'Desktop')
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+function Get-ConfiguredVpnGateway {
+    $roots = @(
+        "$env:ProgramData\Cisco\Cisco Secure Client\VPN\Profile",
+        "$env:ProgramData\Cisco\Cisco AnyConnect Secure Mobility Client\Profile"
+    ) | Where-Object { Test-Path $_ }
+    foreach ($root in $roots) {
+        foreach ($file in (Get-ChildItem -Path $root -Filter '*.xml' -File -ErrorAction SilentlyContinue)) {
+            try {
+                [xml]$profile = Get-Content -Path $file.FullName -Raw -ErrorAction Stop
+                $gateway = @($profile.SelectNodes("//*[local-name()='HostAddress']")) |
+                    ForEach-Object { $_.InnerText.Trim() } | Where-Object { $_ } | Select-Object -First 1
+                if ($gateway) { return $gateway }
+            } catch { }
+        }
+    }
+    return $null
+}
+
+function Test-IcmpStability {
+    param([Parameter(Mandatory)][string]$Target, [Parameter(Mandatory)][int]$Count, [string]$Label)
+    try {
+        $results = @(Test-Connection -ComputerName $Target -Count $Count -ErrorAction SilentlyContinue)
+        $received = $results.Count
+        $lossPercent = [math]::Round((($Count - $received) / $Count) * 100, 1)
+        $times = @($results | ForEach-Object {
+            if ($_.ResponseTime -ne $null) { [double]$_.ResponseTime }
+            elseif ($_.Latency -ne $null) { [double]$_.Latency }
+        })
+        $average = if ($times) { [math]::Round(($times | Measure-Object -Average).Average, 1) } else { $null }
+        $jitter = if ($times.Count -gt 1) {
+            $changes = for ($i = 1; $i -lt $times.Count; $i++) { [math]::Abs($times[$i] - $times[$i - 1]) }
+            [math]::Round(($changes | Measure-Object -Average).Average, 1)
+        } else { $null }
+        [pscustomobject]@{ Test = $Label; Target = $Target; Sent = $Count; Received = $received; LossPercent = $lossPercent; AverageMs = $average; JitterMs = $jitter; Note = $null }
+    } catch {
+        [pscustomobject]@{ Test = $Label; Target = $Target; Sent = $Count; Received = 0; LossPercent = 100; AverageMs = $null; JitterMs = $null; Note = $_.Exception.Message }
+    }
+}
+
+function Test-TcpStability {
+    param([Parameter(Mandatory)][string]$Target, [Parameter(Mandatory)][int]$Count)
+    $times = [System.Collections.Generic.List[double]]::new()
+    $failures = 0
+    foreach ($attempt in 1..$Count) {
+        $client = [System.Net.Sockets.TcpClient]::new()
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            $async = $client.BeginConnect($Target, 443, $null, $null)
+            if (-not $async.AsyncWaitHandle.WaitOne(3000)) { throw 'Timed out after 3 seconds' }
+            $client.EndConnect($async)
+            $stopwatch.Stop()
+            $times.Add([math]::Round($stopwatch.Elapsed.TotalMilliseconds, 1))
+        } catch { $failures++ }
+        finally { $client.Close() }
+        Start-Sleep -Milliseconds 300
+    }
+    $lossPercent = [math]::Round(($failures / $Count) * 100, 1)
+    $average = if ($times) { [math]::Round(($times | Measure-Object -Average).Average, 1) } else { $null }
+    $jitter = if ($times.Count -gt 1) {
+        $changes = for ($i = 1; $i -lt $times.Count; $i++) { [math]::Abs($times[$i] - $times[$i - 1]) }
+        [math]::Round(($changes | Measure-Object -Average).Average, 1)
+    } else { $null }
+    [pscustomobject]@{ Test = 'VPN gateway TCP 443'; Target = $Target; Sent = $Count; Received = $Count - $failures; LossPercent = $lossPercent; AverageMs = $average; JitterMs = $jitter; Note = 'TCP tests verify the route Cisco uses; they do not require VPN login.' }
+}
+
+function Get-WifiSignal {
+    try {
+        $output = netsh wlan show interfaces 2>$null
+        $signalLine = $output | Where-Object { $_ -match '^\s*Signal\s*:' } | Select-Object -First 1
+        if ($signalLine -match '(\d+)%') { return [int]$Matches[1] }
+    } catch { }
+    return $null
+}
+
+function Add-Finding {
+    param([System.Collections.Generic.List[string]]$Findings, [string]$Text)
+    $Findings.Add($Text)
+}
+
+if (-not $VpnGateway) { $VpnGateway = Get-ConfiguredVpnGateway }
+$network = @(Get-NetIPConfiguration -ErrorAction Stop | Where-Object { $_.IPv4DefaultGateway } | Select-Object -First 1)
+$router = if ($network) { $network[0].IPv4DefaultGateway.NextHop } else { $null }
+$wifiSignal = Get-WifiSignal
+$timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+if (-not (Test-Path $OutputDirectory)) { New-Item -Path $OutputDirectory -ItemType Directory -Force | Out-Null }
+$reportPath = Join-Path $OutputDirectory "VPN-Network-Stability-$env:COMPUTERNAME-$timestamp.txt"
+
+Write-Host "Testing network stability. This takes about $([math]::Ceiling($SampleCount * 1.3 / 60)) minute(s)..." -ForegroundColor Cyan
+$routerTest = if ($router) { Test-IcmpStability -Target $router -Count $SampleCount -Label 'Local router' } else { $null }
+$internetTest = Test-IcmpStability -Target '1.1.1.1' -Count $SampleCount -Label 'Internet connection'
+
+$vpnDns = 'Not tested'
+$vpnTest = $null
+if ($VpnGateway) {
+    try { Resolve-DnsName -Name $VpnGateway -ErrorAction Stop | Out-Null; $vpnDns = 'Resolved successfully' }
+    catch { $vpnDns = "Failed: $($_.Exception.Message)" }
+    $vpnTest = Test-TcpStability -Target $VpnGateway -Count $SampleCount
+}
+
+$findings = [System.Collections.Generic.List[string]]::new()
+if (-not $router) { Add-Finding $findings 'ISSUE: No default gateway was detected. The device is not properly connected to the home network.' }
+elseif ($routerTest.Received -eq 0) { Add-Finding $findings 'NOTE: The home router did not respond to ping, so the computer-to-router link cannot be measured directly. This alone does not mean the router is failing.' }
+elseif ($routerTest.LossPercent -ge 5 -or ($routerTest.JitterMs -ne $null -and $routerTest.JitterMs -gt 30)) { Add-Finding $findings 'ISSUE: The connection between the computer and home router is unstable. Move closer to the router, use Ethernet if possible, or restart/troubleshoot Wi-Fi.' }
+elseif ($wifiSignal -ne $null -and $wifiSignal -lt 65) { Add-Finding $findings "ISSUE: Wi-Fi signal is weak ($wifiSignal%). This can cause VPN drops; test closer to the router or on Ethernet." }
+
+if ($internetTest.LossPercent -ge 3 -or ($internetTest.JitterMs -ne $null -and $internetTest.JitterMs -gt 50) -or ($internetTest.AverageMs -ne $null -and $internetTest.AverageMs -gt 150)) {
+    Add-Finding $findings 'ISSUE: The internet connection is unstable (packet loss, high latency, or high jitter). This can interrupt a VPN session. Test Ethernet and contact the ISP if it continues.'
+}
+if (-not $VpnGateway) { Add-Finding $findings 'NEEDS REVIEW: The VPN gateway could not be found from the Cisco profile. Run again with -VpnGateway <company gateway> or validate the Cisco profile deployment.' }
+elseif ($vpnDns -like 'Failed:*') { Add-Finding $findings 'ISSUE: The VPN gateway name cannot be resolved through DNS. This is a DNS, profile, or network issue—not a Wi-Fi-speed issue.' }
+elseif ($vpnTest.LossPercent -ge 10) { Add-Finding $findings 'ISSUE: The VPN gateway is intermittently unreachable on TCP 443. If internet results are clean, escalate as a VPN gateway, proxy, firewall, or routing-path issue.' }
+
+if ($findings.Count -eq 0) {
+    Add-Finding $findings 'PASS: The home network appears stable enough for VPN during this test. If Cisco still fails, investigate the Secure Client profile, certificate, authentication/MFA, endpoint security, or VPN gateway-side logs.'
+}
+
+$report = [System.Collections.Generic.List[string]]::new()
+$report.Add('Cisco VPN Home Network Stability Report')
+$report.Add("Collected: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss K')")
+$report.Add("Computer: $env:COMPUTERNAME")
+$report.Add("Samples per test: $SampleCount")
+$report.Add('Privacy: No passwords, MFA codes, tokens, or browsing history are collected.')
+$report.Add("`r`n===== Verdict =====")
+$report.Add(($findings -join "`r`n"))
+$report.Add("`r`n===== Test Results =====")
+if ($routerTest) { $report.Add(($routerTest | Format-List | Out-String)) }
+$report.Add(($internetTest | Format-List | Out-String))
+$report.Add("Wi-Fi signal: $(if ($wifiSignal -ne $null) { "$wifiSignal%" } else { 'Not detected (wired or unavailable)' })")
+$report.Add("VPN gateway: $(if ($VpnGateway) { $VpnGateway } else { 'Not detected' })")
+$report.Add("VPN DNS: $vpnDns")
+if ($vpnTest) { $report.Add(($vpnTest | Format-List | Out-String)) }
+$report | Set-Content -Path $reportPath -Encoding UTF8
+
+Write-Host "`n===== VPN NETWORK VERDICT =====" -ForegroundColor Yellow
+$findings | ForEach-Object { Write-Host $_ }
+Write-Host "`nReport saved to: $reportPath" -ForegroundColor Green
